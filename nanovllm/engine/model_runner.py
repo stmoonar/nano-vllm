@@ -7,9 +7,32 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.llama import LlamaForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+# Model registry: maps model_type from config to model class
+MODEL_REGISTRY = {
+    "qwen3": Qwen3ForCausalLM,
+    "qwen2": Qwen3ForCausalLM,  # Qwen2 uses same architecture as Qwen3
+    "llama": LlamaForCausalLM,
+}
+
+
+def get_model_class(hf_config):
+    """Get the model class based on the HuggingFace config model_type."""
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type is None:
+        raise ValueError("Cannot determine model type from config")
+
+    model_type = model_type.lower()
+    if model_type not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unsupported model type: {model_type}. "
+            f"Supported types: {list(MODEL_REGISTRY.keys())}"
+        )
+    return MODEL_REGISTRY[model_type]
 
 
 class ModelRunner:
@@ -28,7 +51,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_class = get_model_class(hf_config)
+        self.model = model_class(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
