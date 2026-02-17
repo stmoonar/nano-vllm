@@ -1,4 +1,5 @@
 import atexit
+import logging
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -10,6 +11,8 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 class LLMEngine:
@@ -91,3 +94,60 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
         return outputs
+
+    def sleep(self, level: int = 1) -> dict:
+        """
+        Put the model in sleep mode to free GPU memory.
+
+        This allows temporarily freeing GPU memory while keeping the model state,
+        useful for scenarios like:
+        - Running multiple models on the same GPU
+        - RLHF workflows where reward models are loaded/unloaded
+        - Memory-constrained inference scenarios
+
+        Args:
+            level: Sleep level
+                - Level 1: Offload model weights to CPU, discard KV cache
+                - Level 2: Discard everything (weights and KV cache)
+
+        Returns:
+            Dictionary with memory statistics including freed_bytes and used_bytes
+        """
+        # Clear scheduler state
+        self.scheduler.clear()
+
+        # Call sleep on model_runner
+        result = self.model_runner.call("sleep", level)
+
+        logger.info(
+            "LLMEngine: Model entered sleep mode (level=%d). "
+            "Freed %.2f GiB, %.2f GiB still in use.",
+            level,
+            result.get("freed_bytes", 0) / 1024**3,
+            result.get("used_bytes", 0) / 1024**3,
+        )
+
+        return result
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """
+        Wake up the model from sleep mode.
+
+        Args:
+            tags: Tags to wake up. If None, wake up all tags.
+                  Valid tags: "weights", "kv_cache"
+        """
+        t0 = perf_counter()
+
+        # Call wake_up on model_runner
+        self.model_runner.call("wake_up", tags)
+
+        t1 = perf_counter()
+        logger.info(
+            "LLMEngine: Model woke up from sleep mode in %.2f ms.",
+            (t1 - t0) * 1000,
+        )
+
+    def is_sleeping(self) -> bool:
+        """Check if the model is currently in sleep mode."""
+        return self.model_runner._is_sleeping

@@ -69,3 +69,10 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def clear(self):
+        """Clear all sequences and release blocks."""
+        for seq in list(self.running):
+            self.block_manager.deallocate(seq)
+        self.running.clear()
+        self.waiting.clear()
