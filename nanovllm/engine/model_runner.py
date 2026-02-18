@@ -32,6 +32,7 @@ class ModelRunner:
         # Sleep mode state
         self._is_sleeping = False
         self._sleep_level = 0
+        self._used_cumem_for_sleep = False
 
         # CUDA graph state (will be populated by capture_cudagraph if not enforce_eager)
         self.graphs = None
@@ -349,17 +350,29 @@ class ModelRunner:
 
         freed_bytes = 0
 
-        # Use CuMemAllocator if available (proper GPU memory release via CUDA virtual memory)
-        # Otherwise fall back to SleepModeManager (simple backup to CPU)
+        # Use CuMemAllocator if available AND it has tracked allocations
+        # Otherwise fall back to FallbackSleepModeManager
+        use_cumem = False
         if cumem_available and self.enable_sleep_mode:
-            # With cumem, sleep is handled through the allocator
             allocator = CuMemAllocator.get_instance()
-            offload_tags = ("weights",) if level == 1 else ()
-            freed_bytes = allocator.sleep(offload_tags=offload_tags)
-        else:
-            # Fallback: use SleepModeManager
+            # Only use cumem if it actually has tracked allocations
+            if allocator.get_current_usage() > 0:
+                use_cumem = True
+                offload_tags = ("weights",) if level == 1 else ()
+                freed_bytes = allocator.sleep(offload_tags=offload_tags)
+            else:
+                logger.warning(
+                    "CuMemAllocator has no tracked allocations. "
+                    "Model was not loaded with memory pool. Using fallback."
+                )
+
+        if not use_cumem:
+            # Fallback: use FallbackSleepModeManager
             sleep_manager = FallbackSleepModeManager.get_instance()
             freed_bytes = sleep_manager.sleep_model(self.model, tag="weights", level=level)
+
+        # Track which method was used for wake_up
+        self._used_cumem_for_sleep = use_cumem
 
         # Free KV cache (always discarded, not backed up)
         if hasattr(self, 'kv_cache') and self.kv_cache is not None:
@@ -411,9 +424,9 @@ class ModelRunner:
             logger.warning("Model is not sleeping, nothing to wake up.")
             return
 
-        # Wake up model weights
+        # Wake up model weights - use the same method that was used for sleep
         if tags is None or "weights" in tags:
-            if cumem_available and self.enable_sleep_mode:
+            if getattr(self, '_used_cumem_for_sleep', False):
                 # With cumem, wake_up is handled through the allocator
                 # This re-maps the previously allocated memory
                 allocator = CuMemAllocator.get_instance()

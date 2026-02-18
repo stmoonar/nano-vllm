@@ -605,14 +605,16 @@ class FallbackSleepModeManager:
             backup_name = f"param_{name}"
             if backup_name in backups:
                 cpu_tensor, shape, dtype, orig_device = backups[backup_name]
-                param.data = cpu_tensor.to(device)
+                # Ensure we restore with the correct dtype and device
+                param.data = cpu_tensor.to(device=device, dtype=dtype)
 
         # Restore buffers
         for name, buffer in model.named_buffers():
             backup_name = f"buffer_{name}"
             if backup_name in backups:
                 cpu_tensor, shape, dtype, orig_device = backups[backup_name]
-                buffer.data = cpu_tensor.to(device)
+                # Ensure we restore with the correct dtype and device
+                buffer.data = cpu_tensor.to(device=device, dtype=dtype)
 
         # Clear backup
         del self.cpu_backups[tag]
