@@ -1,6 +1,18 @@
 from functools import lru_cache
+from typing import Any
 import torch
 from torch import nn
+
+
+def _make_hashable(obj: Any) -> Any:
+    """Convert a potentially unhashable object to a hashable one for caching."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return tuple(sorted((k, _make_hashable(v)) for k, v in obj.items()))
+    if isinstance(obj, list):
+        return tuple(_make_hashable(item) for item in obj)
+    return obj
 
 
 def apply_rotary_emb(
@@ -48,7 +60,21 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
+@lru_cache(maxsize=8)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling_hashable: tuple | None = None,
+):
+    """Internal cached version with hashable rope_scaling."""
+    # Currently only support no rope_scaling
+    assert rope_scaling_hashable is None, "rope_scaling is not supported yet"
+    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return rotary_emb
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -56,6 +82,9 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    """Get rotary embedding, with caching support."""
+    # Convert rope_scaling to hashable type for caching
+    rope_scaling_hashable = _make_hashable(rope_scaling)
+    return _get_rope_cached(
+        head_size, rotary_dim, max_position, base, rope_scaling_hashable
+    )
