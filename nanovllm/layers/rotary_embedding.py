@@ -69,8 +69,19 @@ def _get_rope_cached(
     rope_scaling_hashable: tuple | None = None,
 ):
     """Internal cached version with hashable rope_scaling."""
-    # Currently only support no rope_scaling
-    assert rope_scaling_hashable is None, "rope_scaling is not supported yet"
+    # nano-vllm uses basic RotaryEmbedding for all cases
+    # Advanced scaling types (yarn, llama3, etc.) are not fully supported
+    # but we use the base parameters which should work for most cases
+    if rope_scaling_hashable is not None:
+        import warnings
+        # Convert hashable tuple back to dict to extract parameters
+        rope_scaling_dict = dict(rope_scaling_hashable) if rope_scaling_hashable else {}
+        rope_type = rope_scaling_dict.get("rope_type", rope_scaling_dict.get("type", "default"))
+        warnings.warn(
+            f"nano-vllm: rope_scaling type '{rope_type}' is not fully supported, "
+            "using basic RotaryEmbedding. Results may differ from full vLLM.",
+            UserWarning,
+        )
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb
 
