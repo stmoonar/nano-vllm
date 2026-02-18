@@ -34,6 +34,12 @@ class ModelRunner:
         self._is_sleeping = False
         self._sleep_level = 0
 
+        # CUDA graph state (will be populated by capture_cudagraph if not enforce_eager)
+        self.graphs = None
+        self.graph_pool = None
+        self.graph_vars = None
+        self.graph_bs = None
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -115,19 +121,33 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
+    def allocate_kv_cache(self, realloc: bool = False):
         config = self.config
         hf_config = config.hf_config
+        device = f"cuda:{self.rank}"
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        if realloc and config.num_kvcache_blocks > 0:
+            # Use previously calculated number of blocks for reallocation
+            num_blocks = config.num_kvcache_blocks
+        else:
+            # Calculate based on memory stats
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            num_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+            config.num_kvcache_blocks = num_blocks
+
+        assert num_blocks > 0, f"Not enough GPU memory for KV cache. Free: {free / 1024**3:.2f} GiB"
+
+        self.kv_cache = torch.empty(
+            2, hf_config.num_hidden_layers, num_blocks, self.block_size, num_kv_heads, head_dim,
+            device=device, dtype=hf_config.torch_dtype
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -206,7 +226,9 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        # Use eager mode if CUDA graphs not available (e.g., during sleep)
+        use_eager = self.enforce_eager or self.graphs is None or input_ids.size(0) > 512
+        if is_prefill or use_eager:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -237,12 +259,13 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        device = f"cuda:{self.rank}"
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=device)
+        positions = torch.zeros(max_bs, dtype=torch.int64, device=device)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=device)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size, device=device)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
@@ -305,9 +328,19 @@ class ModelRunner:
         Returns:
             Dictionary with memory statistics
         """
-        from nanovllm.device_allocator.cumem import FallbackMemoryManager
+        from nanovllm.device_allocator.cumem import cumem_available
 
         free_bytes_before = torch.cuda.mem_get_info()[0]
+
+        # Release CUDA graphs first (they hold references to GPU memory)
+        if not self.enforce_eager and self.graphs is not None:
+            del self.graphs
+            del self.graph_pool
+            del self.graph_vars
+            self.graphs = None
+            self.graph_pool = None
+            self.graph_vars = None
+            gc.collect()
 
         # Save buffers before level 2 sleep (they need to be restored)
         if level == 2:
@@ -316,24 +349,30 @@ class ModelRunner:
                 for name, buffer in self.model.named_buffers()
             }
 
-        if self.enable_sleep_mode:
-            # Use CuMemAllocator if available
-            from nanovllm.device_allocator.cumem import CuMemAllocator, cumem_available
+        if self.enable_sleep_mode and cumem_available:
+            # Use CuMemAllocator (vLLM's CUDA virtual memory API)
+            from nanovllm.device_allocator.cumem import CuMemAllocator
 
-            if cumem_available:
-                allocator = CuMemAllocator.get_instance()
-                # Level 1: offload weights, Level 2: discard all
-                allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
-            else:
-                # Fallback to FallbackMemoryManager
-                mem_manager = FallbackMemoryManager.get_instance()
-                mem_manager.sleep_model(self.model, tag="weights", level=level)
-                mem_manager.sleep_kv_cache(self.kv_cache, tag="kv_cache")
+            allocator = CuMemAllocator.get_instance()
+            # Level 1: offload weights, discard kv_cache
+            # Level 2: discard all (no offload)
+            allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         else:
-            # Fallback: use FallbackMemoryManager even without sleep mode config
+            # Fallback: use model.to("cpu")
+            from nanovllm.device_allocator.cumem import FallbackMemoryManager
+
             mem_manager = FallbackMemoryManager.get_instance()
             mem_manager.sleep_model(self.model, tag="weights", level=level)
-            mem_manager.sleep_kv_cache(self.kv_cache, tag="kv_cache")
+
+            # For fallback, manually clear KV cache
+            if hasattr(self, 'kv_cache') and self.kv_cache is not None:
+                del self.kv_cache
+                self.kv_cache = None
+
+        # Force garbage collection and cache clearing
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
         free_bytes_after, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after - free_bytes_before
@@ -363,37 +402,42 @@ class ModelRunner:
             tags: Tags to wake up. If None, wake up all tags.
                   Valid tags: "weights", "kv_cache"
         """
-        from nanovllm.device_allocator.cumem import FallbackMemoryManager
+        from nanovllm.device_allocator.cumem import cumem_available
 
         if not self._is_sleeping:
             logger.warning("Model is not sleeping, nothing to wake up.")
             return
 
-        if self.enable_sleep_mode:
-            from nanovllm.device_allocator.cumem import CuMemAllocator, cumem_available
+        if self.enable_sleep_mode and cumem_available:
+            # Use CuMemAllocator
+            from nanovllm.device_allocator.cumem import CuMemAllocator
 
-            if cumem_available:
-                allocator = CuMemAllocator.get_instance()
-                allocator.wake_up(tags)
-            else:
-                mem_manager = FallbackMemoryManager.get_instance()
-                if tags is None or "weights" in tags:
-                    mem_manager.wake_up_model(self.model, tag="weights")
+            allocator = CuMemAllocator.get_instance()
+            allocator.wake_up(tags)
         else:
+            # Fallback
+            from nanovllm.device_allocator.cumem import FallbackMemoryManager
+
             mem_manager = FallbackMemoryManager.get_instance()
             if tags is None or "weights" in tags:
-                mem_manager.wake_up_model(self.model, tag="weights")
+                mem_manager.wake_up_model(self.model, tag="weights", device=f"cuda:{self.rank}")
 
         # Restore saved buffers after level 2 sleep
         if self._sleep_saved_buffers:
             for name, buffer in self.model.named_buffers():
                 if name in self._sleep_saved_buffers:
-                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
+                    saved = self._sleep_saved_buffers[name]
+                    buffer.data = saved.to(f"cuda:{self.rank}")
             self._sleep_saved_buffers = {}
 
-        # Re-allocate KV cache if it was discarded
+        # Re-allocate KV cache (kv_cache is always discarded during sleep)
         if tags is None or "kv_cache" in tags:
-            self.allocate_kv_cache()
+            with self._maybe_get_memory_pool_context("kv_cache"):
+                self.allocate_kv_cache(realloc=True)
+
+        # Re-capture CUDA graphs
+        if not self.enforce_eager:
+            self.capture_cudagraph()
 
         self._is_sleeping = False
         self._sleep_level = 0
