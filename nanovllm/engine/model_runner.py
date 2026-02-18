@@ -294,16 +294,28 @@ class ModelRunner:
         """
         Get a memory pool context for the specified tag if sleep mode is enabled.
 
-        Note: In nano-vllm's simplified implementation, we don't use a memory pool
-        context. Instead, we directly track the model and tensors after creation.
+        When cumem_allocator C++ extension is available and sleep mode is enabled,
+        this returns a memory pool context that tracks allocations for proper
+        GPU memory release during sleep.
 
         Args:
             tag: The tag for the memory allocation ("weights" or "kv_cache")
 
         Returns:
-            Always returns nullcontext (tracking is done differently)
+            Memory pool context if cumem is available and sleep mode enabled,
+            otherwise nullcontext.
         """
-        # nano-vllm uses direct model/tensor tracking instead of memory pool
+        if not self.enable_sleep_mode:
+            return nullcontext()
+
+        try:
+            from nanovllm.device_allocator.cumem import cumem_available, CuMemAllocator
+            if cumem_available:
+                allocator = CuMemAllocator.get_instance()
+                return allocator.use_memory_pool(tag)
+        except Exception as e:
+            logger.warning(f"Failed to get memory pool context: {e}")
+
         return nullcontext()
 
     def sleep(self, level: int = 1) -> dict:
@@ -318,7 +330,9 @@ class ModelRunner:
         Returns:
             Dictionary with memory statistics
         """
-        from nanovllm.device_allocator.cumem import SleepModeManager
+        from nanovllm.device_allocator.cumem import (
+            cumem_available, CuMemAllocator, FallbackSleepModeManager
+        )
 
         free_bytes_before = torch.cuda.mem_get_info()[0]
 
@@ -333,16 +347,28 @@ class ModelRunner:
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Use SleepModeManager to sleep the model
-        sleep_manager = SleepModeManager.get_instance()
-        sleep_manager.sleep_model(self.model, tag="weights", level=level)
+        freed_bytes = 0
+
+        # Use CuMemAllocator if available (proper GPU memory release via CUDA virtual memory)
+        # Otherwise fall back to SleepModeManager (simple backup to CPU)
+        if cumem_available and self.enable_sleep_mode:
+            # With cumem, sleep is handled through the allocator
+            allocator = CuMemAllocator.get_instance()
+            offload_tags = ("weights",) if level == 1 else ()
+            freed_bytes = allocator.sleep(offload_tags=offload_tags)
+        else:
+            # Fallback: use SleepModeManager
+            sleep_manager = FallbackSleepModeManager.get_instance()
+            freed_bytes = sleep_manager.sleep_model(self.model, tag="weights", level=level)
 
         # Free KV cache (always discarded, not backed up)
         if hasattr(self, 'kv_cache') and self.kv_cache is not None:
+            kv_bytes = self.kv_cache.numel() * self.kv_cache.element_size()
             # Release KV cache memory
             self.kv_cache.data = torch.empty(0, dtype=self.kv_cache.dtype, device=self.kv_cache.device)
             del self.kv_cache
             self.kv_cache = None
+            freed_bytes += kv_bytes
 
         # Force garbage collection and cache clearing
         gc.collect()
@@ -350,7 +376,7 @@ class ModelRunner:
         torch.cuda.synchronize()
 
         free_bytes_after, total = torch.cuda.mem_get_info()
-        freed_bytes = free_bytes_after - free_bytes_before
+        actual_freed_bytes = free_bytes_after - free_bytes_before
         used_bytes = total - free_bytes_after
 
         self._is_sleeping = True
@@ -359,12 +385,12 @@ class ModelRunner:
         logger.info(
             "Sleep mode (level %d) freed %.2f GiB memory, %.2f GiB still in use.",
             level,
-            freed_bytes / 1024**3,
+            actual_freed_bytes / 1024**3,
             used_bytes / 1024**3,
         )
 
         return {
-            "freed_bytes": freed_bytes,
+            "freed_bytes": actual_freed_bytes,
             "used_bytes": used_bytes,
             "level": level,
         }
@@ -377,20 +403,29 @@ class ModelRunner:
             tags: Tags to wake up. If None, wake up all tags.
                   Valid tags: "weights", "kv_cache"
         """
-        from nanovllm.device_allocator.cumem import SleepModeManager
+        from nanovllm.device_allocator.cumem import (
+            cumem_available, CuMemAllocator, FallbackSleepModeManager
+        )
 
         if not self._is_sleeping:
             logger.warning("Model is not sleeping, nothing to wake up.")
             return
 
-        # Use SleepModeManager to wake up the model
+        # Wake up model weights
         if tags is None or "weights" in tags:
-            sleep_manager = SleepModeManager.get_instance()
-            sleep_manager.wake_up_model(self.model, tag="weights", device=f"cuda:{self.rank}")
+            if cumem_available and self.enable_sleep_mode:
+                # With cumem, wake_up is handled through the allocator
+                allocator = CuMemAllocator.get_instance()
+                allocator.wake_up(tags=["weights"])
+            else:
+                # Fallback: use FallbackSleepModeManager
+                sleep_manager = FallbackSleepModeManager.get_instance()
+                sleep_manager.wake_up_model(self.model, tag="weights", device=f"cuda:{self.rank}")
 
         # Re-allocate KV cache (it was discarded during sleep)
         if tags is None or "kv_cache" in tags:
-            self.allocate_kv_cache(realloc=True)
+            with self._maybe_get_memory_pool_context("kv_cache"):
+                self.allocate_kv_cache(realloc=True)
 
         # Re-capture CUDA graphs
         if not self.enforce_eager:
@@ -398,8 +433,6 @@ class ModelRunner:
 
         self._is_sleeping = False
         self._sleep_level = 0
-
-        logger.info("Model woke up from sleep mode.")
 
         logger.info("Model woke up from sleep mode.")
 

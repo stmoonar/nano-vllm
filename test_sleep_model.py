@@ -85,8 +85,20 @@ def tiny_gen(llm, text: str, max_tokens: int) -> str:
     return out[0]["text"] if isinstance(out[0], dict) else out[0].outputs[0].text
 
 
+def check_cumem_extension() -> bool:
+    """Check if cumem_allocator C++ extension is available."""
+    try:
+        from nanovllm.device_allocator.cumem import cumem_available
+        return cumem_available
+    except ImportError:
+        return False
+
+
 def main() -> int:
     args = parse_args()
+
+    # Check cumem extension availability
+    cumem_available = check_cumem_extension()
 
     print("=" * 60)
     print("nano-vllm Sleep Mode Test")
@@ -97,6 +109,10 @@ def main() -> int:
     print(f"Tensor parallel size: {args.tp}")
     print(f"GPU memory utilization: {args.gpu_mem}")
     print(f"Enforce eager: {args.enforce_eager}")
+    print(f"cumem_allocator extension: {'AVAILABLE' if cumem_available else 'NOT AVAILABLE (using fallback)'}")
+    if not cumem_available:
+        print("\n*** NOTE: For proper GPU memory release, compile the C++ extension:")
+        print("    cd nano-vllm && pip install -e .")
     print("=" * 60)
 
     print("\n== Initial GPU Memory ==")
