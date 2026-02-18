@@ -415,6 +415,7 @@ class ModelRunner:
         if tags is None or "weights" in tags:
             if cumem_available and self.enable_sleep_mode:
                 # With cumem, wake_up is handled through the allocator
+                # This re-maps the previously allocated memory
                 allocator = CuMemAllocator.get_instance()
                 allocator.wake_up(tags=["weights"])
             else:
@@ -423,9 +424,12 @@ class ModelRunner:
                 sleep_manager.wake_up_model(self.model, tag="weights", device=f"cuda:{self.rank}")
 
         # Re-allocate KV cache (it was discarded during sleep)
+        # Note: We don't use memory pool context here because:
+        # 1. KV cache is always discarded (not backed up) during sleep
+        # 2. Creating a new MemPool during wake_up can cause issues with
+        #    PyTorch's CUDA caching allocator (captures_underway assertion)
         if tags is None or "kv_cache" in tags:
-            with self._maybe_get_memory_pool_context("kv_cache"):
-                self.allocate_kv_cache(realloc=True)
+            self.allocate_kv_cache(realloc=True)
 
         # Re-capture CUDA graphs
         if not self.enforce_eager:
